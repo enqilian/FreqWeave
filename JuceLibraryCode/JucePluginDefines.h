@@ -50,7 +50,7 @@
  #define JucePlugin_Manufacturer           "Enqi Lian"
 #endif
 #ifndef  JucePlugin_ManufacturerWebsite
- #define JucePlugin_ManufacturerWebsite    "https://github.com/yankei02/FreqWeave"
+ #define JucePlugin_ManufacturerWebsite    "https://github.com/enqilian/FreqWeave"
 #endif
 #ifndef  JucePlugin_ManufacturerEmail
  #define JucePlugin_ManufacturerEmail      ""

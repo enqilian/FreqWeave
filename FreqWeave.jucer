@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<JUCERPROJECT id="fMT9Tk" name="FreqWeave" companyName="Enqi Lian" companyWebsite="https://github.com/yankei02/FreqWeave" projectType="audioplug" useAppConfig="0"
+<JUCERPROJECT id="fMT9Tk" name="FreqWeave" companyName="Enqi Lian" companyWebsite="https://github.com/enqilian/FreqWeave" projectType="audioplug" useAppConfig="0"
               addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1">
   <MAINGROUP id="L8l60Y" name="FreqWeave">
     <GROUP id="{BCF8240F-A643-974B-829B-08431CDE735F}" name="Source">
