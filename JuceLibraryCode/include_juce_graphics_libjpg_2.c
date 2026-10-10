@@ -5,4 +5,4 @@
 
 */
 
-#include <juce_audio_processors/juce_audio_processors_ara.cpp>
+#include <juce_graphics/juce_graphics_libjpg_2.c>

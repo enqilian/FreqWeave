@@ -18,7 +18,7 @@ FreqWeave is a plugin designed for audio signal processing applications. It allo
 1. **Clone the Repository**
 
    ```bash
-   git clone https://github.com/yourusername/exchange-band-audio-processor.git
+   git clone https://github.com/yankei02/FreqWeave.git
    ```
 
 2. **Build the Plugin**

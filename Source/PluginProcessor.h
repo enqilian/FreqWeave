@@ -14,12 +14,12 @@
 //==============================================================================
 /**
 */
-class ExchangeBandAudioProcessor  : public juce::AudioProcessor
+class FreqWeaveAudioProcessor  : public juce::AudioProcessor
 {
 public:
     //==============================================================================
-    ExchangeBandAudioProcessor();
-    ~ExchangeBandAudioProcessor() override;
+    FreqWeaveAudioProcessor();
+    ~FreqWeaveAudioProcessor() override;
 
     //==============================================================================
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
@@ -98,19 +98,21 @@ std::unique_ptr<juce::dsp::WindowingFunction<float>> windowFunction;
     // 公共成员以访问ValueTreeState
     juce::AudioProcessorValueTreeState parameters;
     
-    std::vector<float> mainRingBuffer;  // 主链环形缓冲区
-    std::vector<float> sidechainRingBuffer;  // 侧链环形缓冲区
-    // 封装的环形缓冲区读取函数
-    float readMainRingBuffer(int i) const;
-    float readSidechainRingBuffer(int i) const;
-
 private:
     //==============================================================================
     //管理音频格式
     juce::AudioFormatManager formatManager;
-    // overlap-add buffer
-    juce::AudioBuffer<float> overlapAddBuffer;
-    int overlapWriteIndex = 0;
+    // 流式 STFT 状态（50% 重叠 + Hann 窗 + overlap-add），按声道各一份
+    std::vector<std::vector<float>> mainHistory;   // 每个声道最近 fftSize 个主输入样本（环形）
+    std::vector<std::vector<float>> sideHistory;   // 每个声道最近 fftSize 个侧链样本（环形）
+    std::vector<std::vector<float>> olaBuffer;     // 每个声道的 overlap-add 累加区，长度 fftSize
+    std::vector<std::vector<float>> outFifo;       // 每个声道的输出 FIFO（环形）
+    std::vector<float> fftScratch;                 // FFT 工作区，JUCE 要求长度必须是 2 * fftSize
+    int historyWritePos = 0;                       // history 的写指针，同时也指向最老的样本
+    int hopCounter = 0;                            // 距离下一帧还差多少个样本
+    int outFifoCapacity = 0;
+    int outFifoReadPos = 0;
+    int outFifoCount = 0;
     // 保护 FFT 数据的互斥锁
     juce::CriticalSection fftDataLock;
     // 频率向量
@@ -128,17 +130,12 @@ private:
     // 辅助方法
     void performFFT(float* inputData, std::vector<float>& magnitude, std::vector<float>& phase, bool isMainchain);
     void crossSynthesis();
-    void performIFFT(juce::AudioBuffer<float>& buffer);
-    int mainRingBufferWriteIdx = 0;     // 主链环形缓冲区写入指针
-    int sidechainRingBufferWriteIdx = 0; // 侧链环形缓冲区写入指针
-    int ringBufferReadIdx = 0;          // 读取指针
-    const int bufferSize = 512;         // 每次处理的缓冲区大小
-    int mainSampleCount = 0;
-    int sidechainSampleCount = 0;
+    void performIFFT(float* data);      // data 长度必须是 2 * fftSize，结果在前 fftSize 个元素
+    void processFrame(int channel, bool useSidechain, bool pushOutput);
     std::mutex vectorMutex;
     void adjustSidechainToStereo(juce::AudioBuffer<float>& buffer, int mainNumChannels);
     juce::NormalisableRange<float> createFrequencyRange();
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ExchangeBandAudioProcessor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FreqWeaveAudioProcessor)
 };
 
 

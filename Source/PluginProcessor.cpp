@@ -15,7 +15,7 @@
 
 //==============================================================================
 // PluginProcessor.cpp
-ExchangeBandAudioProcessor::ExchangeBandAudioProcessor()
+FreqWeaveAudioProcessor::FreqWeaveAudioProcessor()
      : AudioProcessor (BusesProperties()
                        .withInput ("Input", juce::AudioChannelSet::stereo(), true)       // 主输入
                        .withInput ("Sidechain", juce::AudioChannelSet::stereo(), true)   // 侧链输入，false代表他不是总线，即为辅助总线。
@@ -38,7 +38,6 @@ parameters (*this, nullptr, juce::Identifier ("Parameters"),
     std::make_unique<juce::AudioParameterFloat>(juce::ParameterID("band2Mix",1), "Band2Mix", 0.0f, 1.0f, 0.01f),
 }),  // 假设频率数据只需要一半
     formatManager(),
-    overlapAddBuffer(2, fftSize),  // overlap-add buffer，假设是立体声
     mainchainFrequency(fftSize / 2),
     sidechainFrequency(fftSize / 2),
     mixedFrequency(fftSize / 2)
@@ -73,26 +72,22 @@ parameters (*this, nullptr, juce::Identifier ("Parameters"),
     outMagnitude.resize(fftSize / 2 + 1);
     outPhase.resize(fftSize / 2 + 1);
     outputFFTData.resize(fftSize, 0.0f); // 逆 FFT 存储 fftSize 个元素
-    mainRingBuffer.resize(fftSize, 0.0f);
-    sidechainRingBuffer.resize(fftSize, 0.0f);
     // 初始化代码
     sampleRateOverFftSize = static_cast<float>(sampleRate) / static_cast<float>(fftSize);
-    jassert(mainRingBuffer.size() == fftSize);  // 确保主链环形缓冲区大小一致
-    jassert(sidechainRingBuffer.size() == fftSize);  // 确保侧链环形缓冲区大小一致
 }
 
 
-ExchangeBandAudioProcessor::~ExchangeBandAudioProcessor()
+FreqWeaveAudioProcessor::~FreqWeaveAudioProcessor()
 {
 }
 
 //==============================================================================
-const juce::String ExchangeBandAudioProcessor::getName() const
+const juce::String FreqWeaveAudioProcessor::getName() const
 {
     return JucePlugin_Name;
 }
 
-bool ExchangeBandAudioProcessor::acceptsMidi() const
+bool FreqWeaveAudioProcessor::acceptsMidi() const
 {
    #if JucePlugin_WantsMidiInput
     return true;
@@ -101,7 +96,7 @@ bool ExchangeBandAudioProcessor::acceptsMidi() const
    #endif
 }
 
-bool ExchangeBandAudioProcessor::producesMidi() const
+bool FreqWeaveAudioProcessor::producesMidi() const
 {
    #if JucePlugin_ProducesMidiOutput
     return true;
@@ -110,7 +105,7 @@ bool ExchangeBandAudioProcessor::producesMidi() const
    #endif
 }
 
-bool ExchangeBandAudioProcessor::isMidiEffect() const
+bool FreqWeaveAudioProcessor::isMidiEffect() const
 {
    #if JucePlugin_IsMidiEffect
     return true;
@@ -119,37 +114,37 @@ bool ExchangeBandAudioProcessor::isMidiEffect() const
    #endif
 }
 
-double ExchangeBandAudioProcessor::getTailLengthSeconds() const
+double FreqWeaveAudioProcessor::getTailLengthSeconds() const
 {
     return 0.0;
 }
 
-int ExchangeBandAudioProcessor::getNumPrograms()
+int FreqWeaveAudioProcessor::getNumPrograms()
 {
     return 1;   // NB: some hosts don't cope very well if you tell them there are 0 programs,
                 // so this should be at least 1, even if you're not really implementing programs.
 }
 
-int ExchangeBandAudioProcessor::getCurrentProgram()
+int FreqWeaveAudioProcessor::getCurrentProgram()
 {
     return 0;
 }
 
-void ExchangeBandAudioProcessor::setCurrentProgram (int index)
+void FreqWeaveAudioProcessor::setCurrentProgram (int index)
 {
 }
 
-const juce::String ExchangeBandAudioProcessor::getProgramName (int index)
+const juce::String FreqWeaveAudioProcessor::getProgramName (int index)
 {
     return {};
 }
 
-void ExchangeBandAudioProcessor::changeProgramName (int index, const juce::String& newName)
+void FreqWeaveAudioProcessor::changeProgramName (int index, const juce::String& newName)
 {
 }
 
 //==============================================================================
-juce::NormalisableRange<float> ExchangeBandAudioProcessor::createFrequencyRange()
+juce::NormalisableRange<float> FreqWeaveAudioProcessor::createFrequencyRange()
 {
     // 定义频率范围的最小值和最大值
     float minFreq = 20.0f;       // 最小频率为 20Hz
@@ -217,7 +212,7 @@ juce::NormalisableRange<float> ExchangeBandAudioProcessor::createFrequencyRange(
     DBG("Create frequency range");
 }
 
-void ExchangeBandAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+void FreqWeaveAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     // 获取输入和输出通道数量
     int mainBusNumInputChannels = getBus(true, 0)->getNumberOfChannels(); // 主输入总线的通道数
@@ -235,9 +230,32 @@ void ExchangeBandAudioProcessor::prepareToPlay (double sampleRate, int samplesPe
     DBG("FIFOs Initialized");
     fft = juce::dsp::FFT (std::log2 (fftSize)); // 初始化 FFT 处理器，使用 FFT 大小的对数值（以 2 为底）
 
-    overlapAddBuffer.setSize (getTotalNumOutputChannels(), fftSize * 2); // 设置存储重叠部分的缓冲区大小
-    overlapAddBuffer.clear(); // 清空重叠缓冲区
-    overlapWriteIndex = 0; // 初始化重叠缓冲区写入索引为 0
+    // 流式 STFT 的全部状态都在这里重建。宿主每次重新配置总线（比如启用侧链）都会走一遍
+    // releaseResources() -> prepareToPlay()，所以这里必须把缓冲区恢复到正确大小并清零，
+    // 否则 processBlock() 会访问大小不对的 vector 导致崩溃。
+    const int numChannels = juce::jmax (1, getTotalNumOutputChannels());
+    const int maxBlock = juce::jmax (samplesPerBlock, fftSize);
+    outFifoCapacity = fftSize * 4 + maxBlock * 2; // 远大于任何时刻 FIFO 里可能积压的样本数
+
+    auto resetChannels = [numChannels] (std::vector<std::vector<float>>& state, int length)
+    {
+        state.assign ((size_t) numChannels, std::vector<float> ((size_t) length, 0.0f));
+    };
+    resetChannels (mainHistory, fftSize);
+    resetChannels (sideHistory, fftSize);
+    resetChannels (olaBuffer, fftSize);
+    resetChannels (outFifo, outFifoCapacity);
+    fftScratch.assign ((size_t) fftSize * 2, 0.0f);
+
+    historyWritePos = 0;
+    hopCounter = 0;
+    outFifoReadPos = 0;
+    outFifoCount = hopSize; // 预填 hopSize 个零，保证输出 FIFO 任何时候都不会被读空
+
+    // 周期 Hann 窗：50% 重叠时相邻两帧的窗口之和恰好等于 1，不做处理时能完美重建
+    windowingTable.resize ((size_t) fftSize);
+    for (int n = 0; n < fftSize; ++n)
+        windowingTable[(size_t) n] = 0.5f * (1.0f - std::cos (juce::MathConstants<float>::twoPi * (float) n / (float) fftSize));
 
     // 初始化 FFT 相关的缓冲区
     mainchainFFTData.resize(fftSize * 2, 0.0f);
@@ -277,32 +295,21 @@ void ExchangeBandAudioProcessor::prepareToPlay (double sampleRate, int samplesPe
     DBG("fftSize Changed");
     int inputBusCount = getBusCount(true); // true 表示输入总线
     DBG("Input Bus Count: " << inputBusCount); // 应该输出 2
+
+    // 流式 STFT 的算法延迟恰好是 fftSize 个采样点（一帧的长度）。
+    // 这里把延迟报告给宿主，宿主才能对其它没经过这个插件的轨道做延迟补偿（PDC），避免轨道错位。
+    setLatencySamples(fftSize);
 }
 
-void ExchangeBandAudioProcessor::releaseResources()
+void FreqWeaveAudioProcessor::releaseResources()
 {
-    // 重置所有缓冲区和处理器
+    // 这里不要清空/释放任何 processBlock() 或编辑器频谱显示会用到的 vector：
+    // 编辑器的定时器可能正在另一个线程读取它们，所有状态都由 prepareToPlay() 统一重建。
     windowFunction.reset();
-    overlapAddBuffer.clear();
-    mainRingBuffer.clear();
-    sidechainRingBuffer.clear();
-    mainMagnitude.clear();
-    mainPhase.clear();
-    sidechainMagnitude.clear();
-    sidechainPhase.clear();
-    mixedMagnitude1.clear();
-    mixedPhase1.clear();
-    mixedMagnitude2.clear();
-    mixedPhase2.clear();
-    outputFFTData.clear();
-    outMagnitude.clear();
-    outPhase.clear();
-    
-    printf("Release Sources");
 }
 
 
-bool ExchangeBandAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
+bool FreqWeaveAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
     DBG("Main Input Channels: " << layouts.getMainInputChannelSet().size());
     DBG("Main Output Channels: " << layouts.getMainOutputChannelSet().size());
@@ -350,42 +357,23 @@ bool ExchangeBandAudioProcessor::isBusesLayoutSupported(const BusesLayout& layou
 
 
 //检查sideChain input是否被激活
-bool ExchangeBandAudioProcessor::isSidechainInputActive() const
+bool FreqWeaveAudioProcessor::isSidechainInputActive() const
 {
-    // 假设侧链需要至少两个输入通道（一个主链，一个侧链）
-    if (getTotalNumInputChannels() < 1) // 至少需要一个输入总线
-        {
-            DBG("No SidechainInput.");
-        }
-    return false;
-
     const juce::AudioProcessor::Bus* sidechainBus = getBus(true, 1); // 输入总线索引 1 为侧链
-    if (sidechainBus)
-    {
-        int sidechainChannels = sidechainBus->getNumberOfChannels();
+    if (sidechainBus == nullptr || !sidechainBus->isEnabled())
+        return false;
 
-        // 如果侧链通道数小于2，则填充为2
-        if (sidechainChannels != 2)
-        {
-            DBG("Sidechain input channel count is not 2, adjusting to stereo.");
-            // 在此处执行调整逻辑，强制为 2 通道（通常这是通过音频处理中的填充实现的）
-            // 例如，你可以将其信号路由到两个通道，确保它是立体声
-            return false; // 或者执行其他行为，取决于你的需求
-        }
-
-        // 确保侧链总线已启用且通道数大于0
-        return sidechainBus->isEnabled() && sidechainChannels > 0;
-    }
-
-    return false;
+    // 侧链单声道、立体声都算激活（跟 isBusesLayoutSupported 的判定保持一致）
+    return sidechainBus->getNumberOfChannels() > 0;
 }
 
 
 
 //FFT操作
-void ExchangeBandAudioProcessor::performFFT(float* inputData, std::vector<float>& magnitude, std::vector<float>& phase, bool isMainchain)
+void FreqWeaveAudioProcessor::performFFT(float* inputData, std::vector<float>& magnitude, std::vector<float>& phase, bool isMainchain)
 {
-    std::lock_guard<std::mutex> lock(vectorMutex); // 确保线程安全
+    // 注意：本函数总是从 processBlock() 内部调用，vectorMutex 在那里已经加过锁，
+    // 这里不能再次加锁——std::mutex 不可重入，重复加锁会导致音频线程死锁。
     // 执行 FFT
     fft.performRealOnlyForwardTransform(inputData);
 
@@ -399,165 +387,121 @@ void ExchangeBandAudioProcessor::performFFT(float* inputData, std::vector<float>
     }
 }
 
-void ExchangeBandAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+void FreqWeaveAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 {
-    // 这里手动检查布局是否有效
-    if (!isBusesLayoutSupported(getBusesLayout()))
-    {
-        // 如果不支持，可能需要采取其他措施，如发送错误或禁用某些功能
-        DBG("Unsupported buses layout!");
-    }
-
+    juce::ScopedNoDenormals noDenormals;
     std::lock_guard<std::mutex> lock(vectorMutex); // 确保线程安全
-    auto numSamples = buffer.getNumSamples();
 
-    // 确保 FFT 相关缓冲区大小正确
-    jassert(mainMagnitude.size() == fftSize / 2 + 1);
-    jassert(mainPhase.size() == fftSize / 2 + 1);
-    jassert(sidechainMagnitude.size() == fftSize / 2 + 1);
-    jassert(sidechainPhase.size() == fftSize / 2 + 1);
-    jassert(mixedMagnitude1.size() == fftSize / 2 + 1);
-    jassert(mixedPhase1.size() == fftSize / 2 + 1);
-    jassert(mixedMagnitude2.size() == fftSize / 2 + 1);
-    jassert(mixedPhase2.size() == fftSize / 2 + 1);
-    jassert(outputFFTData.size() == 2 * fftSize);
-    jassert(overlapAddBuffer.getNumChannels() >= buffer.getNumChannels());
-    jassert(overlapAddBuffer.getNumSamples() >= fftSize * 2);
-    DBG("fftBufferGreat");
-    // 侧链输入激活时，处理主链和侧链
-    if (isSidechainInputActive())
+    const int numSamples = buffer.getNumSamples();
+    const int mainNumChannels = juce::jmin(getBus(true, 0)->getNumberOfChannels(), buffer.getNumChannels());
+
+    // 状态还没有按当前声道数建好（比如宿主还没调用 prepareToPlay），宁可原样放行也不能越界访问
+    if (mainNumChannels <= 0 || (int) mainHistory.size() < mainNumChannels || outFifoCapacity <= 0)
+        return;
+
+    // 侧链总线已启用，并且宿主真的给了足够的声道数，才使用侧链
+    const int sidechainNumChannels = getBus(true, 1)->getNumberOfChannels();
+    const bool useSidechain = isSidechainInputActive()
+                              && sidechainNumChannels > 0
+                              && buffer.getNumChannels() >= mainNumChannels + sidechainNumChannels;
+
+    // 逐样本把输入写进各声道的历史缓冲区，每攒够 hopSize 个新样本就处理一帧（帧长 fftSize，
+    // 帧间 50% 重叠）。没有侧链时也走同样的流程，只是不做频段交换，这样不管侧链有没有接上，
+    // 插件的延迟始终固定为 fftSize，和 setLatencySamples() 报告的一致。
+    for (int sample = 0; sample < numSamples; ++sample)
     {
-        int mainNumChannels = getBus(true, 0)->getNumberOfChannels();
         for (int ch = 0; ch < mainNumChannels; ++ch)
         {
-            buffer.copyFrom(ch, 0, buffer.getReadPointer(ch), numSamples);
-        }
-        int sidechainNumChannels = getBus(true, 1)->getNumberOfChannels();
-        DBG("Main input channels: " << mainNumChannels);
-        DBG("Sidechain input channels: " << sidechainNumChannels);
-        
-        for (int channel = 0; channel < mainNumChannels; ++channel)
-        {
-            const float* readPtr = buffer.getReadPointer(channel);
-            for (int sample = 0; sample < numSamples; ++sample)
+            mainHistory[(size_t) ch][(size_t) historyWritePos] = buffer.getReadPointer(ch)[sample];
+
+            if (useSidechain)
             {
-                mainRingBuffer[mainRingBufferWriteIdx] = readPtr[sample];
-                mainRingBufferWriteIdx = (mainRingBufferWriteIdx + 1) % fftSize;  // 使用模运算确保写入不越界
-                mainSampleCount++;
+                // 侧链是单声道时，左右声道都用它；是立体声时左对左、右对右
+                const int scChannel = mainNumChannels + juce::jmin(ch, sidechainNumChannels - 1);
+                sideHistory[(size_t) ch][(size_t) historyWritePos] = buffer.getReadPointer(scChannel)[sample];
             }
         }
-        DBG("mainRingBufferGet");
+        historyWritePos = (historyWritePos + 1) % fftSize;
 
-        // 将侧链数据写入侧链环形缓冲区
-        for (int channel = 0; channel < sidechainNumChannels; ++channel)
+        if (++hopCounter >= hopSize)
         {
-            const float* readPtr_1 = buffer.getReadPointer(channel + mainNumChannels);  // 获取侧链通道数据
-            for (int sample = 0; sample < numSamples; ++sample)
-            {
-                sidechainRingBuffer[sidechainRingBufferWriteIdx] = readPtr_1[sample];
-                sidechainRingBufferWriteIdx = (sidechainRingBufferWriteIdx + 1) % fftSize;  // 确保不越界
-                sidechainSampleCount++;
-            }
-        }
-        DBG("sidechainRingBufferGet");
-        jassert(mainRingBufferWriteIdx >= 0 && mainRingBufferWriteIdx < fftSize);
-        jassert(sidechainRingBufferWriteIdx >= 0 && sidechainRingBufferWriteIdx < fftSize);
+            hopCounter = 0;
 
-        // 判断是否有足够的数据进行 FFT
-        if (mainSampleCount >= fftSize && sidechainSampleCount >= fftSize)
-        {
-            DBG("Enough data for FFT processing");
+            const bool pushOutput = (outFifoCount + hopSize <= outFifoCapacity);
+            for (int ch = 0; ch < mainNumChannels; ++ch)
+                processFrame(ch, useSidechain, pushOutput);
 
-            std::vector<float> mainFFTData(fftSize);
-            std::vector<float> sidechainFFTData(fftSize);
-
-            for (int i = 0; i < fftSize; ++i)
-            {
-                int readIdx = (mainRingBufferWriteIdx + i - fftSize) % mainRingBuffer.size();
-                if (readIdx < 0)
-                    readIdx += mainRingBuffer.size();
-
-                //mainFFTData[i] = mainRingBuffer[readIdx];
-                //sidechainFFTData[i] = sidechainRingBuffer[readIdx];
-                mainFFTData[i] = mainRingBuffer[(ringBufferReadIdx + i) % fftSize];
-                sidechainFFTData[i] = sidechainRingBuffer[(ringBufferReadIdx + i) % fftSize];
-            }
-
-            juce::String mainFFTString;
-            
-            for (int i = 0; i < fftSize; ++i)
-            {
-                mainFFTString += juce::String(mainFFTData[i], 2) + " "; // 保留2位小数，空格分隔
-            }
-            DBG("Main FFT Data: " << mainFFTString);
-
-            juce::String sidechainFFTString;
-            for (int i = 0; i < fftSize; ++i)
-            {
-                sidechainFFTString += juce::String(sidechainFFTData[i], 2) + " "; // 保留2位小数，空格分隔
-            }
-            DBG("Sidechain FFT Data: " << sidechainFFTString);
-            jassert(mainFFTData.size() == fftSize);
-            jassert(sidechainFFTData.size() == fftSize);
-            DBG("mainFFTData size: " << mainFFTData.size());
-            DBG("sidechainFFTData size: " << sidechainFFTData.size());
-
-            // 执行主链和侧链的 FFT
-            performFFT(mainFFTData.data(), mainMagnitude, mainPhase, true);  // 主链FFT
-            performFFT(sidechainFFTData.data(), sidechainMagnitude, sidechainPhase, false);  // 侧链FFT
-            DBG("performFFT");
-            // 执行交叉合成和 IFFT
-            crossSynthesis();
-            DBG("crossSynthesis");
-            jassert(buffer.getNumSamples() >= fftSize);
-            performIFFT(buffer);
-            DBG("performIFFT");
-
-            // 更新计数器
-            mainSampleCount -= fftSize;
-            sidechainSampleCount -= fftSize;
-            DBG("updateCounter");
-
+            if (pushOutput)
+                outFifoCount += hopSize;
         }
     }
-    else
+
+    // 输入已经全部读完，现在把处理好的输出从 FIFO 里取出来写回缓冲区。
+    // FIFO 在 prepareToPlay() 里预填了 hopSize 个零，正常情况下不会被读空，
+    // 万一不够就补静音，绝不越界。
+    const int available = juce::jmin(numSamples, outFifoCount);
+    for (int ch = 0; ch < mainNumChannels; ++ch)
     {
-        // 侧链未激活时，直接将输入数据复制到输出
-        int mainNumChannels = getBus(true, 0)->getNumberOfChannels();
-        for (int channel = 0; channel < mainNumChannels; ++channel)
-        {
-            buffer.copyFrom(channel, 0, buffer.getReadPointer(channel), numSamples);
-        }
-        DBG("outputDirecly");
+        float* out = buffer.getWritePointer(ch);
+        const auto& fifo = outFifo[(size_t) ch];
+        for (int i = 0; i < numSamples; ++i)
+            out[i] = (i < available) ? fifo[(size_t) ((outFifoReadPos + i) % outFifoCapacity)] : 0.0f;
     }
-//    else // 如果侧链未激活
-//    {
-//        int mainNumChannels = getBus(true, 0)->getNumberOfChannels();
-//        int sidechainNumChannels = getBus(true, 1)->getNumberOfChannels();
-//        // 直接将所有通道的音量设置为 0，输出静音
-//        for (int channel = 0; channel < mainNumChannels; ++channel)
-//        {
-//            float* writePtr = buffer.getWritePointer(channel); // 获取输出通道数据
-//            for (int sample = 0; sample < numSamples; ++sample)
-//            {
-//                writePtr[sample] = 0.0f;  // 设置为静音
-//            }
-//        }
-//
-//        for (int channel = 0; channel < sidechainNumChannels; ++channel)
-//        {
-//            float* writePtr_1 = buffer.getWritePointer(channel + mainNumChannels); // 获取输出通道数据
-//            for (int sample = 0; sample < numSamples; ++sample)
-//            {
-//                writePtr_1[sample] = 0.0f;  // 设置为静音
-//            }
-//        }
-//
-//        DBG("Sidechain not activated: All output muted (volume * 0)");
-//    }
-    
+    outFifoReadPos = (outFifoReadPos + available) % outFifoCapacity;
+    outFifoCount -= available;
 }
-//void ExchangeBandAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+
+void FreqWeaveAudioProcessor::processFrame(int channel, bool useSidechain, bool pushOutput)
+{
+    // 从历史缓冲区取出最近 fftSize 个样本（historyWritePos 指向最老的那个），乘 Hann 窗，
+    // 后半截补零——JUCE 的 FFT 要求工作区长度必须是 2 * fftSize
+    auto loadWindowed = [this] (const std::vector<float>& history)
+    {
+        for (int i = 0; i < fftSize; ++i)
+            fftScratch[(size_t) i] = history[(size_t) ((historyWritePos + i) % fftSize)] * windowingTable[(size_t) i];
+        std::fill(fftScratch.begin() + fftSize, fftScratch.end(), 0.0f);
+    };
+
+    {
+        // 频谱数据会被编辑器的定时器在另一个线程里读取，所以修改期间要持有 bufferLock
+        const juce::ScopedLock sl(bufferLock);
+
+        loadWindowed(mainHistory[(size_t) channel]);
+        performFFT(fftScratch.data(), mainMagnitude, mainPhase, true);
+
+        if (useSidechain)
+        {
+            loadWindowed(sideHistory[(size_t) channel]);
+            performFFT(fftScratch.data(), sidechainMagnitude, sidechainPhase, false);
+            crossSynthesis();
+        }
+        else
+        {
+            outMagnitude = mainMagnitude;
+            outPhase = mainPhase;
+        }
+
+        performIFFT(fftScratch.data());
+    }
+
+    // overlap-add：逆变换结果累加进 OLA 区，最前面 hopSize 个样本已经和上一帧叠加完毕，可以输出了
+    auto& ola = olaBuffer[(size_t) channel];
+    for (int i = 0; i < fftSize; ++i)
+        ola[(size_t) i] += fftScratch[(size_t) i];
+
+    if (pushOutput)
+    {
+        auto& fifo = outFifo[(size_t) channel];
+        const int writePos = (outFifoReadPos + outFifoCount) % outFifoCapacity;
+        for (int i = 0; i < hopSize; ++i)
+            fifo[(size_t) ((writePos + i) % outFifoCapacity)] = ola[(size_t) i];
+    }
+
+    // OLA 区整体前移 hopSize 个样本，尾部补零
+    std::copy(ola.begin() + hopSize, ola.end(), ola.begin());
+    std::fill(ola.end() - hopSize, ola.end(), 0.0f);
+}
+//void FreqWeaveAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 //{
 //    std::lock_guard<std::mutex> lock(vectorMutex); // 确保线程安全
 //    auto numSamples = buffer.getNumSamples();
@@ -618,7 +562,7 @@ void ExchangeBandAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, 
 //    }
 //}
 
-//void ExchangeBandAudioProcessor::crossSynthesis()
+//void FreqWeaveAudioProcessor::crossSynthesis()
 //{
 //
 //    // 获取参数值
@@ -670,85 +614,77 @@ void ExchangeBandAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, 
 //    mixedPhase1 = mainPhase;
 //    mixedMagnitude2 = sidechainMagnitude;
 //    mixedPhase2 = sidechainPhase;
-void ExchangeBandAudioProcessor::crossSynthesis()
+void FreqWeaveAudioProcessor::crossSynthesis()
 {
-    // 1) 获取参数值
-    float cutFrequencyFrom1  = parameters.getParameterAsValue("cutFrequencyFrom1").getValue();
-    float cutFrequencyFrom2  = parameters.getParameterAsValue("cutFrequencyFrom2").getValue();
-    float bandLength         = parameters.getParameterAsValue("FrequencyBandLength").getValue();
-    float exchangeBandValue  = parameters.getParameterAsValue("ExchangeBandValue").getValue();
-    float band1Mix           = parameters.getParameterAsValue("band1Mix").getValue();
-    float band2Mix           = parameters.getParameterAsValue("band2Mix").getValue();
+    // 1) 获取参数值（getRawParameterValue 是无锁的原子读取，适合在音频线程里用；
+    //    getParameterAsValue 每次都会创建 juce::Value 对象，会在音频线程里做堆分配）
+    float cutFrequencyFrom1  = parameters.getRawParameterValue("cutFrequencyFrom1")->load();
+    float cutFrequencyFrom2  = parameters.getRawParameterValue("cutFrequencyFrom2")->load();
+    float bandLength         = parameters.getRawParameterValue("FrequencyBandLength")->load();
+    float exchangeBandValue  = parameters.getRawParameterValue("ExchangeBandValue")->load();
+    float band1Mix           = parameters.getRawParameterValue("band1Mix")->load();
+    float band2Mix           = parameters.getRawParameterValue("band2Mix")->load();
 
-    // 2) 根据 bandLength 计算出实际带宽 bandWidth
-    //    下面这一行是你原先的映射，根据需要可自行修改数值范围
-    float bandWidth = juce::jmap(bandLength, 0.0f, 2.0f, 20.0f, 2000.0f);
+    // 2) 用倍频程（octave）而不是固定 Hz 来定义带宽——这是主流参数 EQ 的 Q 值本质上
+    //    采用的方式：带宽随中心频率等比例缩放，这样同一个 Band Length 设置，
+    //    不管中心频率在哪，在对数频谱图上看起来宽度都是一致的。
+    //    bandLength 参数本身范围还是 [0, 2]（不改自动化范围），只是含义从
+    //    "多少 Hz" 变成 "多少个倍频程"。
+    float octaves = juce::jmap(bandLength, 0.0f, 2.0f, 0.1f, 3.0f);
+    float halfOctave = octaves * 0.5f;
+    float octaveFactor = std::pow(2.0f, halfOctave); // 中心频率 * / octaveFactor = 上/下边界
 
-    // 3) 可选：再对 bandWidth 做一个基本的限幅，别小于 20Hz 或超过 Nyquist
-    bandWidth = juce::jlimit(20.0f, static_cast<float>(sampleRate) / 2.0f, bandWidth);
-    // 4) 计算半带宽 halfBW
-    float halfBW = bandWidth * 0.5f;
+    // 3) 为了保证上下边界不越界，先算出中心频率的合法范围：
+    //    下边界 = centreFreq / octaveFactor >= 20Hz
+    //    上边界 = centreFreq * octaveFactor <= Nyquist
+    float minCenterFreq = 20.0f * octaveFactor;
+    float maxCenterFreq = (sampleRate * 0.5f) / octaveFactor;
 
-    // 5) 为了保证不会越界，先设定中心频率的合法范围
-    //    这样在后面计算 centerBin ± halfBandBins 时就不会触发边界裁剪
-    float minCenterFreq = halfBW;
-    float maxCenterFreq = (sampleRate * 0.5f) - halfBW;
-
-    // 6) 把用户/算法得到的 cutFrequency clamping 到安全范围
     cutFrequencyFrom1 = juce::jlimit(minCenterFreq, maxCenterFreq, cutFrequencyFrom1);
     cutFrequencyFrom2 = juce::jlimit(minCenterFreq, maxCenterFreq, cutFrequencyFrom2);
 
-    // ========== 下面的逻辑就跟以往大同小异，只是注意这时不用再 clamp 20.0f ~ (sampleRate/2.0f) ==========
+    // 4) 每个 band 各自根据自己的中心频率算上下边界（倍频程是乘除关系，
+    //    不是加减关系，所以两个 band 不能共用一个对称的 halfBandBins）
+    float lowerFreq1 = cutFrequencyFrom1 / octaveFactor;
+    float upperFreq1 = cutFrequencyFrom1 * octaveFactor;
+    float lowerFreq2 = cutFrequencyFrom2 / octaveFactor;
+    float upperFreq2 = cutFrequencyFrom2 * octaveFactor;
 
-    // 7) 计算中心 bin 索引
-    int centerBin1 = static_cast<int>(cutFrequencyFrom1 * fftSize / sampleRate);
-    int centerBin2 = static_cast<int>(cutFrequencyFrom2 * fftSize / sampleRate);
+    // 5) 换算成 bin 索引
+    int startBin1 = juce::jmax(0, static_cast<int>(lowerFreq1 * fftSize / sampleRate));
+    int endBin1   = juce::jmin(fftSize / 2, static_cast<int>(upperFreq1 * fftSize / sampleRate));
+    int startBin2 = juce::jmax(0, static_cast<int>(lowerFreq2 * fftSize / sampleRate));
+    int endBin2   = juce::jmin(fftSize / 2, static_cast<int>(upperFreq2 * fftSize / sampleRate));
 
-    // 8) 根据 bandWidth -> halfBW -> 转成 bin 数
-    int halfBandBins = static_cast<int>( (halfBW) * fftSize / sampleRate );
-    // 如果你仍然想保证至少1个bin，就这样
-    halfBandBins = std::max(1, halfBandBins);
-
-    // 注意：如果两个频段都用同样的 bandWidth，就只需要一个 halfBandBins，
-    // 无论是1还是2，值都会一样，这样两个频段才会相同。
-    // 如果你用相同 bandWidth，那 halfBandBins1 == halfBandBins2，
-    // 这里演示就写成一个 halfBandBins 即可，省去重复代码。
-
-    // 9) 计算 startBin/endBin（这里保留 jmax / jmin 也无妨，
-    //    因为通过前面的 clamp，这里基本不会再被“截掉”了）
-    int startBin1 = juce::jmax(0, centerBin1 - halfBandBins);
-    int endBin1   = juce::jmin(fftSize / 2, centerBin1 + halfBandBins);
-
-    int startBin2 = juce::jmax(0, centerBin2 - halfBandBins);
-    int endBin2   = juce::jmin(fftSize / 2, centerBin2 + halfBandBins);
+    // 保证至少有 1 个 bin 宽
+    if (endBin1 <= startBin1) endBin1 = juce::jmin(fftSize / 2, startBin1 + 1);
+    if (endBin2 <= startBin2) endBin2 = juce::jmin(fftSize / 2, startBin2 + 1);
 
     // 10) 断言检查，确认不会越界
     jassert(startBin1 >= 0 && startBin1 <= fftSize / 2);
     jassert(endBin1   >= 0 && endBin1   <= fftSize / 2);
     jassert(startBin2 >= 0 && startBin2 <= fftSize / 2);
     jassert(endBin2   >= 0 && endBin2   <= fftSize / 2);
-    DBG("startBinAndEndBinGreat");
 
-    // 11) 如果你想直接查看两个band的长度是否一致，可以 dbg一下:
-    int len1 = endBin1 - startBin1 + 1;
-    int len2 = endBin2 - startBin2 + 1;
-    DBG("band1 bin length: " << len1 << ", band2 bin length: " << len2);
-
-    // 12) 初始化混合后的幅度和相位
+    // 12) 初始化混合后的幅度和相位（band1、band2 都以主输入为基底，互不影响）
     mixedMagnitude1 = mainMagnitude;
     mixedPhase1     = mainPhase;
-    mixedMagnitude2 = sidechainMagnitude;
-    mixedPhase2     = sidechainPhase;
-    // 在 band1 频段内混合主链和侧链
+    mixedMagnitude2 = mainMagnitude;
+    mixedPhase2     = mainPhase;
+
+    // exchangeBandValue != 0 时为"硬切换"：band1、band2 各自在自己的频率范围内
+    // 完全替换为侧链内容，不再跟另一个 band 互换位置（避免把 band1 的内容搬到 band2 的频率上）；
+    // exchangeBandValue == 0 时为"混合"：按各自的 Mix 比例在自己的频率范围内混合主链和侧链
+    const bool hardSwap = exchangeBandValue != 0.0f;
+
+    // 在 band1 频段内，独立地对主链和侧链进行交换/混合
     for (int i = startBin1; i <= endBin1; ++i)
     {
         try
         {
-            // 混合主链和侧链的幅度
-            mixedMagnitude1.at(i) = (1.0f - band1Mix) * mainMagnitude.at(i) + band1Mix * sidechainMagnitude.at(i);
-
-            // 混合主链和侧链的相位
-            mixedPhase1.at(i) = (1.0f - band1Mix) * mainPhase.at(i) + band1Mix * sidechainPhase.at(i);
+            float mix = hardSwap ? 1.0f : band1Mix;
+            mixedMagnitude1.at(i) = (1.0f - mix) * mainMagnitude.at(i) + mix * sidechainMagnitude.at(i);
+            mixedPhase1.at(i) = (1.0f - mix) * mainPhase.at(i) + mix * sidechainPhase.at(i);
         }
         catch (const std::out_of_range& e)
         {
@@ -756,17 +692,14 @@ void ExchangeBandAudioProcessor::crossSynthesis()
         }
     }
 
-    // 在 band2 频段内混合主链和侧链
+    // 在 band2 频段内，独立地对主链和侧链进行交换/混合（不再依赖 band1 的位置或索引）
     for (int i = startBin2; i <= endBin2; ++i)
     {
         try
         {
-            // 混合主链和侧链的幅度
-            mixedMagnitude1.at(i) = (1.0f - band2Mix) * mainMagnitude.at(i) + band2Mix * sidechainMagnitude.at(i);
-
-            // 混合主链和侧链的相位
-            mixedPhase1.at(i) = (1.0f - band2Mix) * mainPhase.at(i) + band2Mix * sidechainPhase.at(i);
-
+            float mix = hardSwap ? 1.0f : band2Mix;
+            mixedMagnitude2.at(i) = (1.0f - mix) * mainMagnitude.at(i) + mix * sidechainMagnitude.at(i);
+            mixedPhase2.at(i) = (1.0f - mix) * mainPhase.at(i) + mix * sidechainPhase.at(i);
         }
         catch (const std::out_of_range& e)
         {
@@ -774,23 +707,7 @@ void ExchangeBandAudioProcessor::crossSynthesis()
         }
     }
 
-    // 根据 exchangeBandValue 进行更复杂的频段交换
-    if (exchangeBandValue != 0.0f)
-    {
-        // 完全交换 band1 和 band2 的频域数据
-        for (int i = startBin1, j = startBin2; i <= endBin1 && j <= endBin2; ++i, ++j)
-        {
-            try
-            {
-                std::swap(mixedMagnitude1.at(i), mixedMagnitude2.at(j));
-                std::swap(mixedPhase1.at(i), mixedPhase2.at(j));
-            }
-            catch (const std::out_of_range& e)
-            {
-                DBG("Out of range access in exchangeBandValue != 0.0f loop at indices (" << i << ", " << j << "): " << e.what());
-            }
-        }
-    }
+    // 汇总成最终输出频谱：band1、band2 各自生效于自己的频率范围，其余频率保持主输入不变
     outMagnitude = mainMagnitude;
     outPhase = mainPhase;
     for (int i = startBin1; i <= endBin1; ++i)
@@ -806,140 +723,43 @@ void ExchangeBandAudioProcessor::crossSynthesis()
 }
 
 
-void ExchangeBandAudioProcessor::performIFFT(juce::AudioBuffer<float>& buffer)
+void FreqWeaveAudioProcessor::performIFFT(float* data)
 {
-    std::lock_guard<std::mutex> lock(vectorMutex); // 确保线程安全
+    // 注意：本函数只在 processFrame() 里调用，vectorMutex 已经在 processBlock() 里加过锁，
+    // 这里不能再次加锁——std::mutex 不可重入，重复加锁会导致音频线程死锁。
+    std::fill(data, data + 2 * fftSize, 0.0f);
 
-    for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+    // 只需要填 [0 ~ fftSize/2] 这 fftSize/2 + 1 个复数 bin，JUCE 的实数逆变换只会用到这一半
+    for (int i = 0; i <= fftSize / 2; ++i)
     {
-        // 1) 清空输出频域数据，确保没有垃圾数据
-        std::fill(outputFFTData.begin(), outputFFTData.end(), 0.0f);
-
-        //===========================================================
-        // 2) 正频率部分 [0 ~ fftSize/2]
-        //    使用 outMagnitude[i]、outPhase[i]
-        //===========================================================
-        for (int i = 0; i <= fftSize / 2; ++i)
-        {
-            // 根据 outMagnitude/outPhase 来生成实部 & 虚部
-            float mag   = outMagnitude[i];
-            float ph    = outPhase[i];
-
-            int index   = 2 * i;
-            jassert(index + 1 < outputFFTData.size());
-
-            outputFFTData[index]     = mag * std::cos(ph);   // 实部
-            outputFFTData[index + 1] = mag * std::sin(ph);   // 虚部
-        }
-
-        //===========================================================
-        // 3) 负频率部分 (1 ~ fftSize/2 - 1)，做“对称共轭”镜像
-        //    注：i=0 和 i=fftSize/2 这两个点都是实数，无需重复。
-        //===========================================================
-        for (int i = 1; i < fftSize / 2; ++i)
-        {
-            // 取出正频率的幅度和相位
-            float mag   = outMagnitude[i];
-            float ph    = outPhase[i];
-
-            // 负频率对应的索引
-            int conjIndex = 2 * (fftSize - i);
-            jassert(conjIndex + 1 < outputFFTData.size());
-
-            // 负频率部分是正频率的共轭 -> e^{-j\theta} = cos(-θ) + i sin(-θ)
-            // 这里要注意一下：如果你后面还要手动再对 “虚部取负一次”，
-            // 那么这里你可以先写成 cos(ph), sin(ph)。具体看你的实现约定。
-            //
-            // 常规写法：cos(-θ) = cos(θ)，sin(-θ) = -sin(θ)
-            outputFFTData[conjIndex]     = mag * std::cos(-ph);  // = mag * cos(ph)
-            outputFFTData[conjIndex + 1] = mag * std::sin(-ph);  // = - (mag * sin(ph))
-        }
-
-        //===========================================================
-        // 4) 确保 DC(0Hz) 和 Nyquist(fftSize/2) 频率的虚部为 0
-        //===========================================================
-        outputFFTData[1] = 0.0f;  // DC 的虚部
-        outputFFTData[2 * (fftSize / 2) + 1] = 0.0f; // Nyquist 虚部
-
-        //===========================================================
-        // 5) 手动对虚部取负，以实现共轭对称
-        //    这一步要根据你的 transform 实现而定。
-        //    绝大多数 JUCE 的例子中，performRealOnlyInverseTransform
-        //    往往需要先对所有虚部取负一次。
-        //===========================================================
-        for (int i = 0; i < 2 * fftSize; i += 2)
-        {
-            outputFFTData[i + 1] = -outputFFTData[i + 1];
-        }
-
-        //===========================================================
-        // 6) 执行逆 FFT ( 注意：与正变换不同的是调用函数名称或参数！ )
-        //    如果你这里用的是 performRealOnlyForwardTransform 做逆变换，
-        //    说明你的库/代码里把这个当作逆变换在使用，请确保理解一致。
-        //===========================================================
-        fft.performRealOnlyForwardTransform(outputFFTData.data());
-
-        //===========================================================
-        // 7) 再次手动对虚部取负，以完成逆 FFT 的共轭操作
-        //===========================================================
-        for (int i = 0; i < 2 * fftSize; i += 2)
-        {
-            outputFFTData[i + 1] = -outputFFTData[i + 1];
-        }
-
-        //===========================================================
-        // 8) 归一化 (ifft 通常要除以 fftSize)
-        //===========================================================
-        for (int i = 0; i < fftSize; ++i)
-        {
-            outputFFTData[i] /= float(fftSize);
-        }
-
-        //===========================================================
-        // 9) overlap-add（OLA）写入
-        //===========================================================
-        overlapAddBuffer.addFrom(channel, overlapWriteIndex, outputFFTData.data(), fftSize);
+        data[2 * i]     = outMagnitude[(size_t) i] * std::cos(outPhase[(size_t) i]);   // 实部
+        data[2 * i + 1] = outMagnitude[(size_t) i] * std::sin(outPhase[(size_t) i]);   // 虚部
     }
 
-    //===========================================================
-    // 10) 将 OLA 缓冲区数据写回输出音频缓冲区
-    //===========================================================
-    for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
-    {
-        float* outputBufferData  = buffer.getWritePointer(channel);
-        const float* overlapData = overlapAddBuffer.getReadPointer(channel, overlapWriteIndex);
+    // DC(0Hz) 和 Nyquist 的虚部必须为 0
+    data[1] = 0.0f;
+    data[2 * (fftSize / 2) + 1] = 0.0f;
 
-        for (int sample = 0; sample < fftSize; ++sample)
-        {
-            if (sample < overlapAddBuffer.getNumSamples())
-                outputBufferData[sample] += overlapData[sample];
-            else
-                DBG("Index out of range in output buffer loop at sample " << sample);
-        }
-    }
-
-    //===========================================================
-    // 11) 更新重叠写入索引
-    //===========================================================
-    overlapWriteIndex = (overlapWriteIndex + fftSize) % (2 * fftSize);
+    // JUCE 的实数逆变换内部会做归一化，结果在前 fftSize 个元素里，不需要再手动除以 fftSize
+    fft.performRealOnlyInverseTransform(data);
 }
 
 
 
 
 //==============================================================================
-bool ExchangeBandAudioProcessor::hasEditor() const
+bool FreqWeaveAudioProcessor::hasEditor() const
 {
     return true; // (change this to false if you choose to not supply an editor)
 }
 
-juce::AudioProcessorEditor* ExchangeBandAudioProcessor::createEditor()
+juce::AudioProcessorEditor* FreqWeaveAudioProcessor::createEditor()
 {
-    return new ExchangeBandAudioProcessorEditor (*this);
+    return new FreqWeaveAudioProcessorEditor (*this);
 }
 
 //==============================================================================
-void ExchangeBandAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+void FreqWeaveAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     // 使用 AudioProcessorValueTreeState 的 copyState 方法复制当前状态
     juce::ValueTree state = parameters.copyState();
@@ -952,7 +772,7 @@ void ExchangeBandAudioProcessor::getStateInformation (juce::MemoryBlock& destDat
         copyXmlToBinary (*xml, destData);
 }
 
-void ExchangeBandAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+void FreqWeaveAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     // 从二进制数据中解析出 XML 元素
     std::unique_ptr<juce::XmlElement> xmlState (getXmlFromBinary (data, sizeInBytes));
@@ -972,5 +792,5 @@ void ExchangeBandAudioProcessor::setStateInformation (const void* data, int size
 // This creates new instances of the plugin..
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new ExchangeBandAudioProcessor();
+    return new FreqWeaveAudioProcessor();
 }
